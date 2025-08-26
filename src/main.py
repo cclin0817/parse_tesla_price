@@ -215,7 +215,7 @@ def run_full_scraper():
     try:
         from tesla_price_scraper import TeslaPriceScraper
         scraper = TeslaPriceScraper()
-        scraper.run_scraper()
+        scraper.run()
         return True
     except ImportError:
         print("❌ 找不到 tesla_price_scraper.py")

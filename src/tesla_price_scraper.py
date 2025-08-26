@@ -1,6 +1,8 @@
 #!/home/cclin/.local/python311/bin/python3
+#!/home/cclin/.local/python311/bin/python3
 """
-Tesla 台灣認證中古車爬蟲 - 繞過 Akamai 防護版本
+Tesla 台灣認證中古車爬蟲 - 完整動態載入版本
+修正：處理虛擬滾動，收集所有出現過的車輛資料
 """
 
 import time
@@ -10,14 +12,14 @@ from datetime import datetime
 import logging
 import re
 import random
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 # 先導入 selenium webdriver（一定需要）
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.options import Options
 
@@ -58,8 +60,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class TeslaScraper:
-    """Tesla 反反爬蟲增強版爬蟲"""
+class TeslaPriceScraper:
+    """Tesla 完整動態載入爬蟲 - 處理虛擬滾動"""
 
     def __init__(self, db_path: str = "tesla_prices.db", debug_mode: bool = False):
         self.db_path = db_path
@@ -236,35 +238,6 @@ class TeslaScraper:
 
         return driver
 
-    def human_like_behavior(self, driver):
-        """模擬人類行為"""
-        # 隨機移動滑鼠
-        action = ActionChains(driver)
-
-        # 獲取頁面大小
-        width = driver.execute_script("return window.innerWidth")
-        height = driver.execute_script("return window.innerHeight")
-
-        # 隨機移動滑鼠 3-5 次
-        for _ in range(random.randint(3, 5)):
-            x = random.randint(100, width - 100)
-            y = random.randint(100, height - 100)
-
-            action.move_by_offset(x, y)
-            action.pause(random.uniform(0.1, 0.3))
-
-        try:
-            action.perform()
-        except:
-            pass
-
-        # 隨機捲動
-        scroll_times = random.randint(2, 4)
-        for _ in range(scroll_times):
-            scroll_amount = random.randint(100, 300)
-            driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
-            time.sleep(random.uniform(0.5, 1.5))
-
     def wait_and_solve_challenge(self, driver):
         """等待並嘗試解決可能的挑戰（如 Cloudflare）"""
         logger.info("檢查是否有安全挑戰...")
@@ -287,6 +260,365 @@ class TeslaScraper:
             time.sleep(random.uniform(2, 4))
             driver.refresh()
             time.sleep(random.uniform(5, 8))
+
+    def scroll_and_collect_vehicles(self, driver, model: str) -> List[Dict]:
+        """
+        滾動頁面並收集所有出現過的車輛（處理虛擬滾動）
+
+        Args:
+            driver: WebDriver 實例
+            model: 車型
+
+        Returns:
+            List[Dict]: 所有收集到的車輛資料
+        """
+        logger.info("開始滾動並收集車輛資料...")
+
+        # 使用 Set 儲存已見過的車輛（根據唯一識別碼去重）
+        collected_vehicles = {}  # 使用 dict，key 為唯一識別碼
+        no_new_vehicles_count = 0
+        last_count = 0
+
+        # 首先滾動到頂部
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(2)
+
+        # 最多滾動次數
+        max_scrolls = 100
+
+        for scroll_count in range(max_scrolls):
+            # 收集當前可見的車輛
+            current_batch = self.collect_visible_vehicles(driver, model)
+
+            # 將新車輛加入到總集合中
+            new_vehicles_count = 0
+            for vehicle in current_batch:
+                # 使用 VIN 或其他唯一識別碼作為 key
+                unique_key = vehicle.get('vin') or vehicle.get('unique_id') or str(vehicle)
+                if unique_key and unique_key not in collected_vehicles:
+                    collected_vehicles[unique_key] = vehicle
+                    new_vehicles_count += 1
+
+            current_total = len(collected_vehicles)
+            logger.info(f"滾動 {scroll_count + 1}/{max_scrolls}: 累計收集 {current_total} 輛車 (本次新增 {new_vehicles_count} 輛)")
+
+            # 檢查是否有新車輛
+            if current_total == last_count:
+                no_new_vehicles_count += 1
+                # 連續5次沒有新車輛，可能已經載入完畢
+                if no_new_vehicles_count >= 5:
+                    logger.info(f"已載入所有車輛，共收集 {current_total} 輛")
+                    break
+            else:
+                no_new_vehicles_count = 0
+                last_count = current_total
+
+            # 執行滾動
+            self.smart_scroll(driver, scroll_count)
+
+            # 等待新內容載入
+            time.sleep(random.uniform(2, 4))
+
+            # 每10次滾動做一次額外檢查
+            if scroll_count % 10 == 9:
+                # 快速滾動到底再回來，觸發更多載入
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+                time.sleep(2)
+
+        # 最後再檢查一次
+        final_batch = self.collect_visible_vehicles(driver, model)
+        for vehicle in final_batch:
+            unique_key = vehicle.get('vin') or vehicle.get('unique_id') or str(vehicle)
+            if unique_key and unique_key not in collected_vehicles:
+                collected_vehicles[unique_key] = vehicle
+
+        # 轉換為列表返回
+        result = list(collected_vehicles.values())
+        logger.info(f"滾動完成，最終收集 {len(result)} 輛車")
+
+        return result
+
+    def collect_visible_vehicles(self, driver, model: str) -> List[Dict]:
+        """
+        收集當前可見的車輛資料
+
+        Args:
+            driver: WebDriver 實例
+            model: 車型
+
+        Returns:
+            List[Dict]: 當前可見的車輛資料
+        """
+        vehicles = []
+
+        # 多個可能的選擇器
+        selectors = [
+            "article.result.card",
+            "article.result",
+            "div.result-container",
+            "article[class*='result']",
+            "div[class*='vehicle']",
+            ".tds-card",
+            "[data-id]",
+            "[data-vin]",
+            "article[data-vin]",
+            "div[data-id]"
+        ]
+
+        elements_found = False
+        for selector in selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    logger.debug(f"使用選擇器 {selector} 找到 {len(elements)} 個元素")
+
+                    for element in elements:
+                        try:
+                            # 檢查元素是否可見
+                            if not element.is_displayed():
+                                continue
+
+                            # 解析車輛資料
+                            vehicle_data = self.parse_vehicle_element_enhanced(element, model)
+                            if vehicle_data:
+                                vehicles.append(vehicle_data)
+                                elements_found = True
+                        except StaleElementReferenceException:
+                            # 元素已經不在 DOM 中，跳過
+                            continue
+                        except Exception as e:
+                            logger.debug(f"解析元素失敗: {e}")
+                            continue
+
+                    if elements_found:
+                        break
+            except Exception as e:
+                logger.debug(f"選擇器 {selector} 失敗: {e}")
+                continue
+
+        # 如果標準選擇器都失敗，嘗試更廣泛的搜尋
+        if not vehicles:
+            try:
+                # 嘗試找所有包含價格資訊的元素
+                all_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'NT$') or contains(text(), 'TWD')]/..")
+                logger.debug(f"廣泛搜尋找到 {len(all_elements)} 個可能的元素")
+
+                for element in all_elements[:50]:  # 限制處理數量避免過慢
+                    try:
+                        vehicle_data = self.parse_vehicle_element_enhanced(element, model)
+                        if vehicle_data:
+                            vehicles.append(vehicle_data)
+                    except:
+                        continue
+            except:
+                pass
+
+        return vehicles
+
+    def smart_scroll(self, driver, iteration: int):
+        """
+        智能滾動策略
+
+        Args:
+            driver: WebDriver 實例
+            iteration: 當前滾動次數
+        """
+        # 獲取頁面資訊
+        page_height = driver.execute_script("return document.body.scrollHeight")
+        window_height = driver.execute_script("return window.innerHeight")
+        current_position = driver.execute_script("return window.pageYOffset")
+
+        # 根據迭代次數使用不同策略
+        if iteration % 3 == 0:
+            # 每3次做一次大幅滾動
+            target = min(current_position + window_height * 2, page_height)
+        elif iteration % 3 == 1:
+            # 小幅滾動
+            target = min(current_position + window_height * 0.5, page_height)
+        else:
+            # 中幅滾動
+            target = min(current_position + window_height, page_height)
+
+        # 如果已經到底，回滾一點再繼續
+        if current_position >= page_height - window_height:
+            target = page_height * 0.7
+
+        # 平滑滾動
+        driver.execute_script(f"""
+            window.scrollTo({{
+                top: {target},
+                behavior: 'smooth'
+            }});
+        """)
+
+    def parse_vehicle_element_enhanced(self, element, model: str) -> Optional[Dict]:
+        """
+        增強版車輛元素解析
+
+        Args:
+            element: WebElement
+            model: 車型
+
+        Returns:
+            Optional[Dict]: 解析後的車輛資料
+        """
+        try:
+            # 獲取元素文字
+            text = element.text
+            if not text or len(text) < 10:
+                return None
+
+            # 基本資料結構
+            data = {
+                'model': model.upper(),
+                'scrape_datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+
+            # 嘗試獲取 data 屬性
+            try:
+                data_vin = element.get_attribute('data-vin')
+                if data_vin:
+                    data['vin'] = data_vin
+
+                data_id = element.get_attribute('data-id')
+                if data_id:
+                    data['unique_id'] = data_id
+            except:
+                pass
+
+            # 提取價格（必要欄位）
+            price_patterns = [
+                r'NT\$\s*([\d,]+)',
+                r'TWD\s*([\d,]+)',
+                r'NTD\s*([\d,]+)',
+                r'\$\s*([\d,]+)',
+                r'([\d,]+)\s*元',
+                r'售價[：:]\s*([\d,]+)',
+                r'Price[：:]\s*([\d,]+)'
+            ]
+
+            price_found = False
+            for pattern in price_patterns:
+                price_match = re.search(pattern, text, re.IGNORECASE)
+                if price_match:
+                    price_str = price_match.group(1).replace(',', '')
+                    price = int(price_str)
+                    # 檢查價格是否合理（10萬到1000萬之間）
+                    if 100000 <= price <= 10000000:
+                        data['price'] = price
+                        price_found = True
+                        break
+
+            # 如果沒有價格，這可能不是車輛元素
+            if not price_found:
+                return None
+
+            # 提取 VIN（如果還沒有）
+            if 'vin' not in data:
+                vin_match = re.search(r'5YJ[A-Z0-9]{14}', text)
+                if vin_match:
+                    data['vin'] = vin_match.group()
+                else:
+                    # 生成唯一ID（使用價格和部分文字的hash）
+                    import hashlib
+                    unique_text = f"{model}_{data['price']}_{text[:50]}"
+                    data['unique_id'] = hashlib.md5(unique_text.encode()).hexdigest()[:12]
+
+            # 提取年份
+            year_patterns = [
+                r'(20[12][0-9])\s*年',
+                r'Year[：:]\s*(20[12][0-9])',
+                r'(20[12][0-9])\s+Model',
+                r'(20[12][0-9])'
+            ]
+
+            for pattern in year_patterns:
+                year_match = re.search(pattern, text)
+                if year_match:
+                    year = int(year_match.group(1))
+                    if 2010 <= year <= 2025:
+                        data['year'] = year
+                        break
+
+            # 提取里程
+            mileage_patterns = [
+                r'([\d,]+)\s*(?:km|公里|KM)',
+                r'里程[：:]\s*([\d,]+)',
+                r'Mileage[：:]\s*([\d,]+)',
+                r'ODO[：:]\s*([\d,]+)'
+            ]
+
+            for pattern in mileage_patterns:
+                mileage_match = re.search(pattern, text, re.IGNORECASE)
+                if mileage_match:
+                    mileage_str = mileage_match.group(1).replace(',', '')
+                    mileage = int(mileage_str)
+                    # 檢查里程是否合理（0到50萬公里）
+                    if 0 <= mileage <= 500000:
+                        data['mileage'] = mileage
+                        break
+
+            # 提取地點
+            locations = [
+                '台北', '新北', '桃園', '台中', '台南', '高雄',
+                '基隆', '新竹', '苗栗', '彰化', '南投', '雲林',
+                '嘉義', '屏東', '宜蘭', '花蓮', '台東', '澎湖',
+                '金門', '連江', 'Taipei', 'Taichung', 'Kaohsiung'
+            ]
+
+            for location in locations:
+                if location in text:
+                    data['location'] = location
+                    break
+
+            # 提取顏色
+            colors = {
+                'Pearl White': '珍珠白',
+                'Solid Black': '純黑',
+                'Midnight Silver': '午夜銀',
+                'Deep Blue': '深藍',
+                'Red': '紅色',
+                '珍珠白': '珍珠白',
+                '純黑': '純黑',
+                '午夜銀': '午夜銀',
+                '深藍': '深藍',
+                '紅色': '紅色'
+            }
+
+            for eng, chi in colors.items():
+                if eng in text or chi in text:
+                    data['exterior_color'] = chi
+                    break
+
+            # 提取配置
+            if 'Long Range' in text or '長續航' in text:
+                data['trim'] = 'Long Range'
+            elif 'Performance' in text or '高性能' in text:
+                data['trim'] = 'Performance'
+            elif 'Standard' in text or '標準' in text:
+                data['trim'] = 'Standard Range'
+
+            # 嘗試獲取連結
+            try:
+                links = element.find_elements(By.TAG_NAME, "a")
+                for link in links:
+                    href = link.get_attribute('href')
+                    if href and 'tesla.com' in href:
+                        data['listing_url'] = href
+                        break
+            except:
+                pass
+
+            # 儲存原始資料（限制長度）
+            data['raw_data'] = text[:500]
+
+            return data
+
+        except Exception as e:
+            logger.debug(f"解析元素失敗: {e}")
+            return None
 
     def scrape_with_retry(self, model: str, max_retries: int = 3) -> List[Dict]:
         """
@@ -314,7 +646,7 @@ class TeslaScraper:
 
     def scrape_with_selenium(self, model: str) -> List[Dict]:
         """
-        使用 Selenium 爬取資料（增強版）
+        使用 Selenium 爬取資料（處理虛擬滾動）
         """
         if model not in self.base_urls:
             logger.error(f"不支援的車型: {model}")
@@ -335,9 +667,6 @@ class TeslaScraper:
             driver.get("https://www.tesla.com/zh_tw")
             time.sleep(random.uniform(3, 5))
 
-            # 模擬人類行為
-            self.human_like_behavior(driver)
-
             # 第二步：訪問目標頁面
             logger.info(f"訪問目標頁面: {url}")
             driver.get(url)
@@ -345,29 +674,23 @@ class TeslaScraper:
             # 等待並處理可能的挑戰
             self.wait_and_solve_challenge(driver)
 
-            # 模擬人類行為
-            self.human_like_behavior(driver)
+            # 等待初始內容載入
+            time.sleep(random.uniform(5, 8))
 
-            # 等待頁面載入
-            wait = WebDriverWait(driver, 30)
+            # 重要：使用新的滾動收集方法
+            vehicles = self.scroll_and_collect_vehicles(driver, model)
 
             # 截圖（偵錯用）
             if self.debug_mode:
                 driver.save_screenshot(f'debug_{model}_final.png')
                 logger.info(f"已儲存截圖: debug_{model}_final.png")
 
-                # 儲存頁面源碼
-                with open(f'debug_{model}_source.html', 'w', encoding='utf-8') as f:
-                    f.write(driver.page_source)
-                logger.info(f"已儲存頁面源碼: debug_{model}_source.html")
+                # 儲存收集到的資料
+                with open(f'debug_{model}_vehicles.json', 'w', encoding='utf-8') as f:
+                    json.dump(vehicles, f, ensure_ascii=False, indent=2, default=str)
+                logger.info(f"已儲存車輛資料: debug_{model}_vehicles.json")
 
-            # 檢查是否被阻擋
-            if 'access denied' in driver.page_source.lower():
-                logger.error("仍然被阻擋，可能需要其他方法")
-                return []
-
-            # 嘗試解析頁面
-            vehicles = self.extract_vehicles_from_page(driver, model)
+            logger.info(f"成功收集 {len(vehicles)} 輛車的資料")
 
         except Exception as e:
             logger.error(f"Selenium 爬取失敗: {e}")
@@ -380,153 +703,10 @@ class TeslaScraper:
 
         return vehicles
 
-    def extract_vehicles_from_page(self, driver, model: str) -> List[Dict]:
-        """從頁面提取車輛資料"""
-        vehicles = []
-
-        # 等待可能的車輛卡片載入
-        time.sleep(5)
-
-        # 嘗試各種可能的選擇器
-        selectors = [
-            "article.result",
-            "div.result-container",
-            "article[class*='result']",
-            "div[class*='vehicle']",
-            "[data-id]",
-            "[data-vin]"
-        ]
-
-        vehicle_elements = []
-        for selector in selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                if elements:
-                    logger.info(f"找到 {len(elements)} 個元素使用選擇器: {selector}")
-                    vehicle_elements = elements
-                    break
-            except:
-                continue
-
-        if not vehicle_elements:
-            logger.warning("未找到車輛元素")
-
-            # 嘗試從 JavaScript 提取
-            vehicles = self.extract_from_javascript_enhanced(driver)
-
-        else:
-            # 解析元素
-            for element in vehicle_elements:
-                try:
-                    vehicle_data = self.parse_vehicle_element(element, model)
-                    if vehicle_data:
-                        vehicles.append(vehicle_data)
-                except Exception as e:
-                    logger.error(f"解析元素失敗: {e}")
-
-        return vehicles
-
-    def extract_from_javascript_enhanced(self, driver) -> List[Dict]:
-        """增強版 JavaScript 資料提取"""
-        logger.info("嘗試從 JavaScript 提取資料...")
-
-        try:
-            # 嘗試獲取 React/Next.js 資料
-            result = driver.execute_script("""
-                // 檢查各種可能的資料來源
-                if (window.__NEXT_DATA__) {
-                    return window.__NEXT_DATA__;
-                }
-                if (window.__INITIAL_STATE__) {
-                    return window.__INITIAL_STATE__;
-                }
-
-                // 檢查 React 元件的 props
-                const root = document.querySelector('#root') || document.querySelector('#__next');
-                if (root && root._reactRootContainer) {
-                    return root._reactRootContainer;
-                }
-
-                // 查找包含車輛資料的全域變數
-                for (let key in window) {
-                    if (key.toLowerCase().includes('inventory') ||
-                        key.toLowerCase().includes('vehicle') ||
-                        key.toLowerCase().includes('data')) {
-                        const value = window[key];
-                        if (value && typeof value === 'object' &&
-                            (Array.isArray(value) || value.results || value.vehicles)) {
-                            return {found: key, data: value};
-                        }
-                    }
-                }
-
-                return null;
-            """)
-
-            if result:
-                logger.info(f"找到 JavaScript 資料: {type(result)}")
-                # 這裡需要根據實際的資料結構來解析
-                # 可以將結果寫入檔案分析結構
-                if self.debug_mode:
-                    with open('debug_js_data.json', 'w', encoding='utf-8') as f:
-                        json.dump(result, f, ensure_ascii=False, indent=2, default=str)
-                    logger.info("JavaScript 資料已儲存到 debug_js_data.json")
-
-        except Exception as e:
-            logger.error(f"JavaScript 提取失敗: {e}")
-
-        return []
-
-    def parse_vehicle_element(self, element, model: str) -> Optional[Dict]:
-        """解析車輛元素"""
-        try:
-            data = {
-                'model': model.upper(),
-                'scrape_datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-
-            # 獲取所有文字
-            text = element.text
-
-            # 提取價格
-            price_match = re.search(r'(?:NT\$|TWD|NTD)\s*([\d,]+)', text)
-            if price_match:
-                data['price'] = int(price_match.group(1).replace(',', ''))
-
-            # 提取 VIN
-            vin_match = re.search(r'5YJ[A-Z0-9]{14}', text)
-            if vin_match:
-                data['vin'] = vin_match.group()
-
-            # 提取年份
-            year_match = re.search(r'20(1[0-9]|2[0-4])', text)
-            if year_match:
-                data['year'] = int(year_match.group())
-
-            # 提取里程
-            mileage_match = re.search(r'([\d,]+)\s*(?:km|公里)', text, re.IGNORECASE)
-            if mileage_match:
-                data['mileage'] = int(mileage_match.group(1).replace(',', ''))
-
-            # 獲取連結
-            try:
-                link = element.find_element(By.TAG_NAME, "a")
-                data['listing_url'] = link.get_attribute('href')
-            except:
-                pass
-
-            data['raw_data'] = text[:500]
-
-            return data if 'price' in data else None
-
-        except Exception as e:
-            logger.error(f"解析元素失敗: {e}")
-            return None
-
     def run(self):
         """執行主程式"""
         logger.info("\n" + "="*60)
-        logger.info("開始執行 Tesla 反反爬蟲增強版爬蟲")
+        logger.info("開始執行 Tesla 完整動態載入爬蟲")
         logger.info("="*60)
 
         all_vehicles = []
@@ -553,9 +733,35 @@ class TeslaScraper:
         if all_vehicles:
             self.save_to_database(all_vehicles)
             logger.info(f"\n✅ 總共獲取 {len(all_vehicles)} 筆資料")
+            self.print_summary(all_vehicles)
         else:
             logger.warning("\n⚠️ 未獲取到任何資料")
             self.suggest_alternative_methods()
+
+    def print_summary(self, vehicles: List[Dict]):
+        """列印爬取結果摘要"""
+        logger.info("\n" + "="*60)
+        logger.info("爬取結果摘要")
+        logger.info("="*60)
+
+        # 統計各車型數量
+        model_counts = {}
+        for vehicle in vehicles:
+            model = vehicle.get('model', 'Unknown')
+            model_counts[model] = model_counts.get(model, 0) + 1
+
+        for model, count in model_counts.items():
+            logger.info(f"{model}: {count} 輛")
+
+        # 統計價格範圍
+        prices = [v['price'] for v in vehicles if 'price' in v]
+        if prices:
+            logger.info(f"\n價格範圍: NT${min(prices):,} - NT${max(prices):,}")
+            logger.info(f"平均價格: NT${sum(prices)/len(prices):,.0f}")
+
+        # 顯示部分 VIN 以確認資料
+        vins = [v.get('vin', v.get('unique_id', 'N/A'))[:10] for v in vehicles[:5]]
+        logger.info(f"\n前5筆資料識別碼: {', '.join(vins)}")
 
     def suggest_alternative_methods(self):
         """建議替代方法"""
@@ -574,13 +780,13 @@ class TeslaScraper:
 3. 使用 DrissionPage (更強大的反檢測):
    pip install DrissionPage
 
-4. 手動解決:
-   - 使用瀏覽器擴充功能匯出資料
-   - 使用瀏覽器開發者工具監控 API 請求
+4. 監控網路請求:
+   - 使用瀏覽器開發者工具查看 API 端點
+   - 直接請求 API 獲取資料
 
-5. API 方法:
-   - 尋找 Tesla 的官方 API
-   - 使用第三方資料服務
+5. 半自動方案:
+   - 手動登入後再執行爬蟲
+   - 使用瀏覽器擴充功能輔助
         """)
 
     def save_to_database(self, vehicles: List[Dict]):
@@ -588,8 +794,12 @@ class TeslaScraper:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
+        saved_count = 0
         for vehicle in vehicles:
             try:
+                # 使用 VIN 或 unique_id 作為識別
+                vin = vehicle.get('vin') or vehicle.get('unique_id')
+
                 cursor.execute('''
                     INSERT OR REPLACE INTO vehicle_prices
                     (vin, model, year, trim, price, mileage, location,
@@ -597,7 +807,7 @@ class TeslaScraper:
                      scrape_datetime, listing_url, raw_data)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    vehicle.get('vin'),
+                    vin,
                     vehicle.get('model'),
                     vehicle.get('year'),
                     vehicle.get('trim'),
@@ -611,16 +821,19 @@ class TeslaScraper:
                     vehicle.get('listing_url'),
                     vehicle.get('raw_data', '')
                 ))
+                saved_count += 1
             except Exception as e:
                 logger.error(f"儲存失敗: {e}")
 
         conn.commit()
         conn.close()
 
+        logger.info(f"成功儲存 {saved_count}/{len(vehicles)} 筆資料到資料庫")
+
 def main():
     """主程式"""
     print("\n" + "="*60)
-    print("Tesla 反反爬蟲增強版爬蟲")
+    print("Tesla 完整動態載入爬蟲")
     print("="*60)
 
     # 檢查必要套件
@@ -644,7 +857,7 @@ def main():
             return
 
     # 執行爬蟲
-    scraper = TeslaScraper(debug_mode=True)
+    scraper = TeslaPriceScraper(debug_mode=True)
     scraper.run()
 
 if __name__ == "__main__":
